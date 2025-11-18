@@ -2744,6 +2744,7 @@ impl cpu::Vcpu for KvmVcpu {
             msr!(msr_index::MSR_LSTAR),
             msr!(msr_index::MSR_KERNEL_GS_BASE),
             msr!(msr_index::MSR_SYSCALL_MASK),
+            msr_data!(msr_index::MSR_IA32_FEATURE_CONTROL, 0x5),
             msr!(msr_index::MSR_IA32_TSC),
             msr_data!(
                 msr_index::MSR_IA32_MISC_ENABLE,
