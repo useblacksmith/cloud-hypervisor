@@ -1,0 +1,111 @@
+---
+- name: Check and Verify Nested Virtualization Support
+  hosts: all
+  gather_facts: yes
+  become: yes
+  tasks:
+    - name: Get CPU architecture
+      shell: uname -m
+      register: cpu_arch
+      changed_when: false
+
+    - name: Skip ARM hosts
+      meta: end_host
+      when: cpu_arch.stdout != "x86_64"
+
+    - name: Get CPU vendor (Intel or AMD)
+      shell: |
+        if grep -q "GenuineIntel" /proc/cpuinfo; then
+          echo "intel"
+        elif grep -q "AuthenticAMD" /proc/cpuinfo; then
+          echo "amd"
+        else
+          echo "unknown"
+        fi
+      register: cpu_vendor
+      changed_when: false
+
+    - name: Check if virtualization is supported in CPU
+      shell: grep -qE 'vmx|svm' /proc/cpuinfo && echo "yes" || echo "no"
+      register: virt_support
+      changed_when: false
+
+    - name: Check if KVM modules are loaded
+      shell: lsmod | grep -E '^kvm' | awk '{print $1}'
+      register: kvm_modules
+      changed_when: false
+      failed_when: false
+
+    - name: Check nested virtualization status (Intel)
+      shell: |
+        if [ -f /sys/module/kvm_intel/parameters/nested ]; then
+          cat /sys/module/kvm_intel/parameters/nested
+        else
+          echo "not_loaded"
+        fi
+      register: intel_nested
+      changed_when: false
+      when: cpu_vendor.stdout == "intel"
+
+    - name: Check nested virtualization status (AMD)
+      shell: |
+        if [ -f /sys/module/kvm_amd/parameters/nested ]; then
+          cat /sys/module/kvm_amd/parameters/nested
+        else
+          echo "not_loaded"
+        fi
+      register: amd_nested
+      changed_when: false
+      when: cpu_vendor.stdout == "amd"
+
+    - name: Check if cloud-hypervisor is installed
+      shell: which cloud-hypervisor || echo "not_found"
+      register: ch_installed
+      changed_when: false
+      failed_when: false
+
+    - name: Check cloud-hypervisor version
+      shell: cloud-hypervisor --version 2>/dev/null || echo "not_available"
+      register: ch_version
+      changed_when: false
+      failed_when: false
+      when: ch_installed.stdout != "not_found"
+
+    - name: Check for running cloud-hypervisor VMs
+      shell: ps aux | grep -v grep | grep cloud-hypervisor | wc -l
+      register: ch_vms
+      changed_when: false
+
+    - name: Display comprehensive report
+      debug:
+        msg:
+          - "========================================"
+          - "Host: {{ inventory_hostname }}"
+          - "Public IP: {{ public_ip | default('N/A') }} | Region: {{ region | default('N/A') }}"
+          - "========================================"
+          - "CPU Vendor: {{ cpu_vendor.stdout | upper }}"
+          - "Hardware Virtualization (VMX/SVM): {{ virt_support.stdout | upper }}"
+          - "KVM Modules: {{ kvm_modules.stdout_lines | default(['none']) | join(', ') }}"
+          - "{% if cpu_vendor.stdout == 'intel' %}Nested Virt (Intel): {{ intel_nested.stdout }}{% endif %}"
+          - "{% if cpu_vendor.stdout == 'amd' %}Nested Virt (AMD): {{ amd_nested.stdout }}{% endif %}"
+          - "Cloud Hypervisor: {{ 'Installed' if ch_installed.stdout != 'not_found' else 'Not Installed' }}"
+          - "Running VMs: {{ ch_vms.stdout }}"
+          - "========================================"
+          - "{% if (cpu_vendor.stdout == 'intel' and intel_nested.stdout in ['Y', '1']) or (cpu_vendor.stdout == 'amd' and amd_nested.stdout in ['Y', '1']) %}✓ NESTED VIRTUALIZATION: ENABLED{% else %}✗ NESTED VIRTUALIZATION: DISABLED{% endif %}"
+          - "========================================"
+
+- name: Generate Summary Report
+  hosts: localhost
+  gather_facts: no
+  run_once: true
+  tasks:
+    - name: Create summary
+      debug:
+        msg:
+          - ""
+          - "=========================================="
+          - "         SUMMARY OF ALL HOSTS"
+          - "=========================================="
+          - "Total hosts checked: {{ groups['all'] | length }}"
+          - "Check the output above for detailed status"
+          - "=========================================="

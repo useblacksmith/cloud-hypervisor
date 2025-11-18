@@ -1,0 +1,143 @@
+---
+- name: Enable Nested Virtualization on x86_64 hosts
+  hosts: all
+  gather_facts: yes
+  become: yes
+  tasks:
+    - name: Get CPU architecture
+      shell: uname -m
+      register: cpu_arch
+      changed_when: false
+
+    - name: Skip ARM hosts
+      meta: end_host
+      when: cpu_arch.stdout != "x86_64"
+    - name: Get CPU vendor
+      shell: |
+        if grep -q "GenuineIntel" /proc/cpuinfo; then
+          echo "intel"
+        elif grep -q "AuthenticAMD" /proc/cpuinfo; then
+          echo "amd"
+        else
+          echo "unknown"
+        fi
+      register: cpu_vendor
+      changed_when: false
+
+    - name: Check current nested virtualization status (Intel)
+      shell: cat /sys/module/kvm_intel/parameters/nested 2>/dev/null || echo "not_loaded"
+      register: current_intel_nested
+      changed_when: false
+      when: cpu_vendor.stdout == "intel"
+
+    - name: Check current nested virtualization status (AMD)
+      shell: cat /sys/module/kvm_amd/parameters/nested 2>/dev/null || echo "not_loaded"
+      register: current_amd_nested
+      changed_when: false
+      when: cpu_vendor.stdout == "amd"
+
+    - name: Create modprobe.d directory if it doesn't exist
+      file:
+        path: /etc/modprobe.d
+        state: directory
+        mode: '0755'
+
+    - name: Enable nested virtualization for Intel (persistent)
+      copy:
+        content: |
+          # Enable nested virtualization for Intel CPUs
+          options kvm_intel nested=1
+        dest: /etc/modprobe.d/kvm-nested.conf
+        mode: '0644'
+      when:
+        - cpu_vendor.stdout == "intel"
+        - current_intel_nested.stdout not in ['Y', '1']
+      register: intel_config
+
+    - name: Enable nested virtualization for AMD (persistent)
+      copy:
+        content: |
+          # Enable nested virtualization for AMD CPUs
+          options kvm_amd nested=1
+        dest: /etc/modprobe.d/kvm-nested.conf
+        mode: '0644'
+      when:
+        - cpu_vendor.stdout == "amd"
+        - current_amd_nested.stdout not in ['Y', '1']
+      register: amd_config
+
+    - name: Check if any VMs are running
+      shell: ps aux | grep -v grep | grep -E 'qemu-system|cloud-hypervisor' | wc -l
+      register: running_vms
+      changed_when: false
+
+    - name: Enable nested virtualization immediately (Intel) - if no VMs running
+      shell: |
+        rmmod kvm_intel 2>/dev/null || true
+        rmmod kvm 2>/dev/null || true
+        modprobe kvm
+        modprobe kvm_intel nested=1
+      when:
+        - cpu_vendor.stdout == "intel"
+        - intel_config.changed
+        - running_vms.stdout == "0"
+      register: intel_reload
+      ignore_errors: yes
+
+    - name: Enable nested virtualization immediately (AMD) - if no VMs running
+      shell: |
+        rmmod kvm_amd 2>/dev/null || true
+        rmmod kvm 2>/dev/null || true
+        modprobe kvm
+        modprobe kvm_amd nested=1
+      when:
+        - cpu_vendor.stdout == "amd"
+        - amd_config.changed
+        - running_vms.stdout == "0"
+      register: amd_reload
+      ignore_errors: yes
+
+    - name: Verify nested virtualization is now enabled (Intel)
+      shell: cat /sys/module/kvm_intel/parameters/nested
+      register: verify_intel
+      changed_when: false
+      when: cpu_vendor.stdout == "intel"
+
+    - name: Verify nested virtualization is now enabled (AMD)
+      shell: cat /sys/module/kvm_amd/parameters/nested
+      register: verify_amd
+      changed_when: false
+      when: cpu_vendor.stdout == "amd"
+
+    - name: Display results
+      debug:
+        msg:
+          - "========================================"
+          - "Host: {{ inventory_hostname }} - {{ cpu_vendor.stdout | upper }}"
+          - "{% if cpu_vendor.stdout == 'intel' %}Nested Virt Status: {{ verify_intel.stdout }}{% elif cpu_vendor.stdout == 'amd' %}Nested Virt Status: {{ verify_amd.stdout }}{% endif %}"
+          - "{% if intel_config.changed or amd_config.changed %}✓ Configuration updated in /etc/modprobe.d/kvm-nested.conf{% endif %}"
+          - "{% if running_vms is defined and running_vms.stdout != '0' %}⚠ WARNING: {{ running_vms.stdout }} VMs running - REBOOT REQUIRED{% endif %}"
+          - "{% if (intel_reload is defined and intel_reload.failed) or (amd_reload is defined and amd_reload.failed) %}⚠ WARNING: Could not reload KVM module - REBOOT REQUIRED{% endif %}"
+          - "========================================"
+
+- name: Final Summary
+  hosts: localhost
+  gather_facts: no
+  run_once: true
+  tasks:
+    - name: Summary
+      debug:
+        msg:
+          - ""
+          - "=========================================="
+          - "NESTED VIRTUALIZATION ENABLEMENT COMPLETE"
+          - "=========================================="
+          - "Changes have been made persistent via /etc/modprobe.d/kvm-nested.conf"
+          - ""
+          - "IMPORTANT NOTES:"
+          - "1. If VMs were running or module reload failed, you need to reboot the hosts"
+          - "2. After reboot, run the check_nested_virt.yml playbook to verify"
+          - "3. Once enabled, cloud-hypervisor VMs will automatically expose"
+          - "   virtualization extensions (VMX/SVM) to Windows guests"
+          - "4. Windows VMs can then run Hyper-V, WSL2, and Docker Desktop"
+          - "=========================================="
