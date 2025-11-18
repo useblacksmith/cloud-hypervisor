@@ -2892,6 +2892,7 @@ impl Snapshottable for Vm {
                 &arch::CpuidConfig {
                     phys_bits,
                     kvm_hyperv: self.config.lock().unwrap().cpus.kvm_hyperv,
+                    hide_hypervisor: self.config.lock().unwrap().cpus.hide_hypervisor,
                     #[cfg(feature = "tdx")]
                     tdx: false,
                     amx,

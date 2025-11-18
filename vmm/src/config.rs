@@ -596,6 +596,7 @@ impl CpusConfig {
             .add("max")
             .add("topology")
             .add("kvm_hyperv")
+            .add("hide_hypervisor")
             .add("max_phys_bits")
             .add("affinity")
             .add("features");
@@ -612,6 +613,11 @@ impl CpusConfig {
         let topology = parser.convert("topology").map_err(Error::ParseCpus)?;
         let kvm_hyperv = parser
             .convert::<Toggle>("kvm_hyperv")
+            .map_err(Error::ParseCpus)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let hide_hypervisor = parser
+            .convert::<Toggle>("hide_hypervisor")
             .map_err(Error::ParseCpus)?
             .unwrap_or(Toggle(false))
             .0;
@@ -658,6 +664,7 @@ impl CpusConfig {
             max_vcpus,
             topology,
             kvm_hyperv,
+            hide_hypervisor,
             max_phys_bits,
             affinity,
             features,

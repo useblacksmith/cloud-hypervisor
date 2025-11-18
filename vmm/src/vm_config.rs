@@ -63,6 +63,8 @@ pub struct CpusConfig {
     pub topology: Option<CpuTopology>,
     #[serde(default)]
     pub kvm_hyperv: bool,
+    #[serde(default)]
+    pub hide_hypervisor: bool,
     #[serde(default = "default_cpuconfig_max_phys_bits")]
     pub max_phys_bits: u8,
     #[serde(default)]
@@ -80,6 +82,7 @@ impl Default for CpusConfig {
             max_vcpus: DEFAULT_VCPUS,
             topology: None,
             kvm_hyperv: false,
+            hide_hypervisor: false,
             max_phys_bits: DEFAULT_MAX_PHYS_BITS,
             affinity: None,
             features: CpuFeatures::default(),

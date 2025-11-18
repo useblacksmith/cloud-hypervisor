@@ -1135,6 +1135,7 @@ impl Vmm {
                 &arch::CpuidConfig {
                     phys_bits,
                     kvm_hyperv: vm_config.lock().unwrap().cpus.kvm_hyperv,
+                    hide_hypervisor: vm_config.lock().unwrap().cpus.hide_hypervisor,
                     #[cfg(feature = "tdx")]
                     tdx: false,
                     amx,
@@ -1274,6 +1275,7 @@ impl Vmm {
                 &arch::CpuidConfig {
                     phys_bits,
                     kvm_hyperv: vm_config.cpus.kvm_hyperv,
+                    hide_hypervisor: vm_config.cpus.hide_hypervisor,
                     #[cfg(feature = "tdx")]
                     tdx: false,
                     amx: vm_config.cpus.features.amx,

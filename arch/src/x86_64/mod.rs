@@ -85,6 +85,7 @@ const E820_RESERVED: u32 = 2;
 pub struct CpuidConfig {
     pub phys_bits: u8,
     pub kvm_hyperv: bool,
+    pub hide_hypervisor: bool,
     #[cfg(feature = "tdx")]
     pub tdx: bool,
     pub amx: bool,
@@ -576,16 +577,6 @@ pub fn generate_common_cpuid(
     );
     #[allow(unused_mut)]
     let mut cpuid_patches = vec![
-        // Patch hypervisor bit
-        CpuidPatch {
-            function: 1,
-            index: 0,
-            flags_bit: None,
-            eax_bit: None,
-            ebx_bit: None,
-            ecx_bit: Some(HYPERVISOR_ECX_BIT),
-            edx_bit: None,
-        },
         // Enable MTRR feature
         CpuidPatch {
             function: 1,
@@ -597,6 +588,19 @@ pub fn generate_common_cpuid(
             edx_bit: Some(MTRR_EDX_BIT),
         },
     ];
+
+    // Only set hypervisor bit if not hiding it
+    if !config.hide_hypervisor {
+        cpuid_patches.insert(0, CpuidPatch {
+            function: 1,
+            index: 0,
+            flags_bit: None,
+            eax_bit: None,
+            ebx_bit: None,
+            ecx_bit: Some(HYPERVISOR_ECX_BIT),
+            edx_bit: None,
+        });
+    }
 
     #[cfg(feature = "kvm")]
     if matches!(
@@ -773,6 +777,12 @@ pub fn generate_common_cpuid(
                 ..Default::default()
             });
         }
+    }
+
+    // If hide_hypervisor is enabled, remove all hypervisor CPUID leaves (0x40000000-0x4FFFFFFF)
+    // This hides the hypervisor signature from the guest OS
+    if config.hide_hypervisor {
+        cpuid.retain(|c| c.function < 0x40000000 || c.function > 0x4FFFFFFF);
     }
 
     Ok(cpuid)

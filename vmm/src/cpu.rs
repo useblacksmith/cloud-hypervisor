@@ -890,6 +890,7 @@ impl CpuManager {
                 &arch::CpuidConfig {
                     phys_bits,
                     kvm_hyperv: self.config.kvm_hyperv,
+                    hide_hypervisor: self.config.hide_hypervisor,
                     #[cfg(feature = "tdx")]
                     tdx,
                     amx: self.config.features.amx,
