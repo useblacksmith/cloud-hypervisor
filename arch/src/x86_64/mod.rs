@@ -724,14 +724,44 @@ pub fn generate_common_cpuid(
     }
 
     if config.kvm_hyperv {
-        // Remove conflicting entries
+        // Detect if the host supports nested virtualization.
+        // On AMD: Check CPUID 0x8000_0001.ECX bit 2 (SVM).
+        // On Intel: Check CPUID 0x1.ECX bit 5 (VMX).
+        let nested_virt_supported = {
+            let vendor = hypervisor.get_cpu_vendor();
+            let mut has_nested = false;
+
+            for entry in cpuid.iter() {
+                if matches!(vendor, CpuVendor::AMD) && entry.function == 0x8000_0001 {
+                    has_nested = (entry.ecx & (1 << 2)) != 0;
+                    if has_nested {
+                        info!(
+                            "AMD SVM nested virtualization detected and will be exposed to guest"
+                        );
+                    }
+                    break;
+                } else if matches!(vendor, CpuVendor::Intel) && entry.function == 0x1 {
+                    has_nested = (entry.ecx & (1 << 5)) != 0;
+                    if has_nested {
+                        info!(
+                            "Intel VMX nested virtualization detected and will be exposed to guest"
+                        );
+                    }
+                    break;
+                }
+            }
+            has_nested
+        };
+
+        // Remove conflicting entries.
         cpuid.retain(|c| c.function != 0x4000_0000);
         cpuid.retain(|c| c.function != 0x4000_0001);
-        // See "Hypervisor Top Level Functional Specification" for details
-        // Compliance with "Hv#1" requires leaves up to 0x4000_000a
+
+        // See "Hypervisor Top Level Functional Specification" (TLFS) for details.
+        // Compliance with "Hv#1" requires leaves up to 0x4000_000a.
         cpuid.push(CpuIdEntry {
             function: 0x40000000,
-            eax: 0x4000000a, // Maximum cpuid leaf
+            eax: 0x4000000a, // Maximum cpuid leaf.
             ebx: 0x756e694c, // "Linu"
             ecx: 0x564b2078, // "x KV"
             edx: 0x7648204d, // "M Hv"
@@ -748,23 +778,106 @@ pub fn generate_common_cpuid(
             ebx: 0xa0000, // "Version"
             ..Default::default()
         });
+
+        // Leaf 0x40000003: Partition privilege flags (EAX) and implementation features (EDX).
+        // These control what the guest hypervisor is allowed to do.
+        // Base features always exposed (for basic Windows operation):
+        let mut features_eax = (1 << 1)  // HV_TIME_REF_COUNT_AVAILABLE
+            | (1 << 2)  // HV_SYNIC_AVAILABLE
+            | (1 << 3)  // HV_SYNTIMERS_AVAILABLE
+            | (1 << 9); // HV_REFERENCE_TSC_AVAILABLE
+
+        let mut features_ebx = 0u32;
+
+        let mut features_edx = 1 << 3; // HV_CPU_DYNAMIC_PARTITIONING_AVAILABLE
+
+        // If nested virtualization is supported, expose additional features required
+        // for Windows to operate as an L1 hypervisor (for nested Hyper-V VMs and WSL2).
+        // Based on QEMU's implementation (target/i386/kvm/hyperv-proto.h).
+        if nested_virt_supported {
+            info!("Enabling Hyper-V nested enlightenments for Windows L1 hypervisor support");
+
+            // Additional partition privileges needed for nested operation.
+            features_eax |= (1 << 0)  // HV_VP_RUNTIME_AVAILABLE
+                | (1 << 4)  // HV_APIC_ACCESS_AVAILABLE
+                | (1 << 5)  // HV_HYPERCALL_AVAILABLE - Critical for nested hypercalls
+                | (1 << 6)  // HV_VP_INDEX_AVAILABLE
+                | (1 << 7)  // HV_RESET_AVAILABLE
+                | (1 << 11) // HV_ACCESS_FREQUENCY_MSRS - Critical for TSC/APIC frequency
+                | (1 << 13); // HV_ACCESS_REENLIGHTENMENTS_CONTROL
+
+            // SynIC event/message posting (used by nested VMs).
+            features_ebx |= (1 << 4)  // HV_POST_MESSAGES
+                | (1 << 5); // HV_SIGNAL_EVENTS
+
+            // Additional implementation features for nested scenarios.
+            features_edx |= (1 << 0)  // HV_MWAIT_AVAILABLE
+                | (1 << 5)  // HV_GUEST_IDLE_STATE_AVAILABLE
+                | (1 << 8)  // HV_FREQUENCY_MSRS_AVAILABLE - Pairs with bit 11 in EAX
+                | (1 << 10) // HV_GUEST_CRASH_MSR_AVAILABLE
+                | (1 << 19); // HV_STIMER_DIRECT_MODE_AVAILABLE
+        }
+
+        info!(
+            "Hyper-V CPUID 0x40000003: EAX={features_eax:#010x} EBX={features_ebx:#010x} EDX={features_edx:#010x} (nested={nested_virt_supported})"
+        );
+
         cpuid.push(CpuIdEntry {
             function: 0x4000_0003,
-            eax: (1 << 1) // AccessPartitionReferenceCounter
-                   | (1 << 2) // AccessSynicRegs
-                   | (1 << 3) // AccessSyntheticTimerRegs
-                   | (1 << 9), // AccessPartitionReferenceTsc
-            edx: 1 << 3, // CPU dynamic partitioning
+            eax: features_eax,
+            ebx: features_ebx,
+            edx: features_edx,
             ..Default::default()
         });
+
+        // Leaf 0x40000004: Hypervisor recommendations.
+        let mut recommendations_eax = 1 << 5; // HV_RELAXED_TIMING_RECOMMENDED
+
+        if nested_virt_supported {
+            // Recommend hypercall-based operations for better nested performance.
+            recommendations_eax |= (1 << 3)  // HV_APIC_ACCESS_RECOMMENDED
+                | (1 << 4)  // HV_SYSTEM_RESET_RECOMMENDED
+                | (1 << 10) // HV_CLUSTER_IPI_RECOMMENDED
+                | (1 << 11); // HV_EX_PROCESSOR_MASKS_RECOMMENDED
+        }
+
         cpuid.push(CpuIdEntry {
             function: 0x4000_0004,
-            eax: 1 << 5, // Recommend relaxed timing
+            eax: recommendations_eax,
             ..Default::default()
         });
-        for i in 0x4000_0005..=0x4000_000a {
+
+        // Leaf 0x40000005: Implementation limits.
+        cpuid.push(CpuIdEntry {
+            function: 0x4000_0005,
+            ..Default::default()
+        });
+
+        // Leaves 0x40000006-0x40000009: Reserved/empty.
+        for i in 0x4000_0006..=0x4000_0009 {
             cpuid.push(CpuIdEntry {
                 function: i,
+                ..Default::default()
+            });
+        }
+
+        // Leaf 0x4000000A: Nested hypervisor features.
+        // Only exposed if nested virtualization is supported.
+        if nested_virt_supported {
+            let nested_features_eax = (1 << 17) // HV_NESTED_DIRECT_FLUSH - Direct TLB flush for nested VMs
+                | (1 << 19); // HV_NESTED_MSR_BITMAP - MSR bitmap enlightenment
+
+            info!("Hyper-V CPUID 0x4000000A: EAX={nested_features_eax:#010x} (nested features)");
+
+            cpuid.push(CpuIdEntry {
+                function: 0x4000_000a,
+                eax: nested_features_eax,
+                ..Default::default()
+            });
+        } else {
+            // Still create the leaf but with all zeros to maintain leaf structure.
+            cpuid.push(CpuIdEntry {
+                function: 0x4000_000a,
                 ..Default::default()
             });
         }
