@@ -403,7 +403,15 @@ impl Aml for PciSegment {
                         None,
                     ),
                     #[cfg(target_arch = "x86_64")]
-                    &aml::AddressSpace::new_io(0u16, 0x0cf7u16, None),
+                    // Legacy I/O port ranges for PCI devices.
+                    // Excludes 0x2E8-0x3FF to avoid ACPI resource conflict with legacy serial
+                    // ports (COM1-COM4) on Windows. Windows refuses to load drivers for devices
+                    // when their I/O resources overlap with another device's claimed range.
+                    // COM ports: COM1=0x3F8, COM2=0x2F8, COM3=0x3E8, COM4=0x2E8 (each uses 8 bytes)
+                    #[cfg(target_arch = "x86_64")]
+                    &aml::AddressSpace::new_io(0x0000u16, 0x02e7u16, None),
+                    #[cfg(target_arch = "x86_64")]
+                    &aml::AddressSpace::new_io(0x0400u16, 0x0cf7u16, None),
                     #[cfg(target_arch = "x86_64")]
                     &aml::AddressSpace::new_io(0x0d00u16, 0xffffu16, None),
                 ]),
