@@ -8,7 +8,7 @@ jobs:
   build:
     timeout-minutes: 120
     name: Tests (ARM64)
-    runs-on: bookworm-arm64
+    runs-on: blacksmith-4vcpu-ubuntu-2404-arm
     steps:
       - name: Fix workspace permissions
         run: sudo chown -R runner:runner ${GITHUB_WORKSPACE}

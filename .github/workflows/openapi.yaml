@@ -3,7 +3,7 @@ on: [pull_request, merge_group]
 
 jobs:
   Validate:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     container: openapitools/openapi-generator-cli
     steps:
     - uses: actions/checkout@v6

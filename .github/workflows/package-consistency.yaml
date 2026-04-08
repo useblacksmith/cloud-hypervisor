@@ -7,7 +7,7 @@ concurrency:
 jobs:
   build:
     name: Rust VMM Consistency Check
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Code checkout
         uses: actions/checkout@v6

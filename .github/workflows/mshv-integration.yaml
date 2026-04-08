@@ -22,7 +22,7 @@ jobs:
     name: Integration Tests (x86_64)
     needs: infra-setup
     if: ${{ always() && needs.infra-setup.result == 'success' }}
-    runs-on: mshv
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     continue-on-error: true
     steps:
       - name: Run integration tests
@@ -105,7 +105,7 @@ jobs:
     name: Cleanup
     needs: run-tests
     if: always()
-    runs-on: mshv
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Delete RG
         env:
