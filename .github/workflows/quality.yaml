@@ -7,7 +7,7 @@ concurrency:
 jobs:
   build:
     name: Quality (clippy)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     continue-on-error: ${{ matrix.experimental }}
     strategy:
       fail-fast: false
@@ -163,7 +163,7 @@ jobs:
   typos:
     if: github.event_name == 'pull_request'
     name: Typos / Spellcheck
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v6
       # Executes "typos ."

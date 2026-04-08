@@ -7,7 +7,7 @@ concurrency:
 jobs:
   build:
     name: Cargo
-    runs-on: riscv64-qemu-host
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     strategy:
       fail-fast: false
 

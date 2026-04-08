@@ -7,7 +7,7 @@ on:
 jobs:
   build:
     name: Tests (Metrics)
-    runs-on: bare-metal-9950x
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     env:
       METRICS_PUBLISH_KEY: ${{ secrets.METRICS_PUBLISH_KEY }}
     steps:

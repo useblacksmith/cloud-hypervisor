@@ -49,7 +49,7 @@ concurrency:
 jobs:
   infra-setup:
     name: ${{ inputs.ARCH }} VM Provision
-    runs-on: mshv
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     continue-on-error: true
     outputs:
       RG_NAME: ${{ steps.rg-setup.outputs.RG_NAME }}
