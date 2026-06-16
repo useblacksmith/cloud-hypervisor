@@ -479,8 +479,14 @@ impl Aml for PciSegment {
                         self.end_of_mem64_area,
                         None,
                     ),
+                    // Carve COM1 (0x3f8-0x3ff) out of the PCI root I/O window: COM1
+                    // is a _SB_ sibling (not a child consumer), so leaving 0x3f8 in the
+                    // root window makes Windows reject COM1 with STATUS_CONFLICTING_ADDRESSES
+                    // (Code 12) and serial.sys never binds.
                     #[cfg(target_arch = "x86_64")]
-                    &aml::AddressSpace::new_io(0u16, 0x0cf7u16, None),
+                    &aml::AddressSpace::new_io(0u16, 0x03f7u16, None),
+                    #[cfg(target_arch = "x86_64")]
+                    &aml::AddressSpace::new_io(0x0400u16, 0x0cf7u16, None),
                     #[cfg(target_arch = "x86_64")]
                     &aml::AddressSpace::new_io(0x0d00u16, 0xffffu16, None),
                 ]),
