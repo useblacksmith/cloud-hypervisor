@@ -259,7 +259,15 @@ impl Serial {
                     self.thr_empty()?;
                 }
             }
-            IER => self.interrupt_enable = v & IER_FIFO_BITS,
+            IER => {
+                self.interrupt_enable = v & IER_FIFO_BITS;
+                // A real 16550 asserts the THRE interrupt as soon as it is enabled
+                // while the THR is empty. CH flushes TX synchronously so the THR is
+                // always empty; without this, interrupt-driven TX drivers (Windows
+                // serial.sys) that enable the interrupt and wait before writing the
+                // first byte deadlock (write times out, no bytes emitted).
+                self.thr_empty()?;
+            }
             LCR => self.line_control = v,
             MCR => self.modem_control = v,
             SCR => self.scratch = v,
