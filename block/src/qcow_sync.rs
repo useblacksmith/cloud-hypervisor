@@ -323,6 +323,13 @@ mod unit_tests {
     use crate::qcow_common::unit_tests::compress_allocated_clusters;
     use crate::qcow_disk::QcowDisk;
 
+    // The #[ignore]d scale repros below select the I/O backend via QCOW_IO_URING=1
+    // (qcow_async, the production default) vs unset/0 (qcow_sync). Requires the
+    // binary be built with --features io_uring when set.
+    fn scale_use_io_uring() -> bool {
+        std::env::var("QCOW_IO_URING").map(|v| v == "1").unwrap_or(false)
+    }
+
     fn create_disk_with_data(
         file_size: u64,
         data: &[u8],
@@ -1835,5 +1842,700 @@ mod unit_tests {
 
         let buf = async_read(&disk, 0, cluster_size);
         assert_eq!(buf, data);
+    }
+
+    // Scale repro for the Windows-VM disk corruption. The VM uses the QcowDisk
+    // (qcow_sync) async-io path with a qemu-img backing chain where the overlay's
+    // virtual size exceeds the backing's. This drives that exact path: write GiBs
+    // of offset-encoded data into the beyond-backing region via async_write, then
+    // read it all back via async_read and pinpoint the first mismatch or read
+    // error. Each 8-byte word equals its own file offset so a mismatch reveals
+    // whether the read returned zeros, shifted data, or garbage.
+    //
+    // #[ignore] because it does GiB-scale real I/O; run on the devbox with:
+    //   cargo test -p block --release qcowdisk_scale_beyond_backing -- --ignored --nocapture
+    // Tunable via env (defaults mirror the live failing config at reduced scale):
+    //   QCOW_BACKING_MB (256) QCOW_OVERLAY_GB (64) QCOW_START_MB (512)
+    //   QCOW_TOTAL_GB (24)    QCOW_CHUNK_MB (4)
+    #[test]
+    #[ignore]
+    fn qcowdisk_scale_beyond_backing() {
+        use std::process::Command;
+        let envn = |k: &str, d: u64| -> u64 {
+            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        };
+        let backing_mb = envn("QCOW_BACKING_MB", 256);
+        let overlay_gb = envn("QCOW_OVERLAY_GB", 64);
+        let start = envn("QCOW_START_MB", 512) * 1024 * 1024;
+        let total = envn("QCOW_TOTAL_GB", 24) * 1024 * 1024 * 1024;
+        let chunk = (envn("QCOW_CHUNK_MB", 4) * 1024 * 1024) as usize;
+
+        if Command::new("qemu-img").arg("--version").output().is_err() {
+            eprintln!("SKIP: qemu-img not available");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("chqd_scale_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let backing = dir.join("backing.qcow2");
+        let overlay = dir.join("overlay.qcow2");
+        let qimg = |args: &[&str]| {
+            let out = Command::new("qemu-img").args(args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "qemu-img {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        qimg(&[
+            "create", "-f", "qcow2", backing.to_str().unwrap(),
+            &format!("{backing_mb}M"),
+        ]);
+        qimg(&[
+            "create", "-f", "qcow2", "-b", backing.to_str().unwrap(), "-F", "qcow2",
+            overlay.to_str().unwrap(), &format!("{overlay_gb}G"),
+        ]);
+        eprintln!(
+            "chain: backing {backing_mb} MiB <- overlay {overlay_gb} GiB; \
+             writing {} GiB starting at {} MiB (beyond backing), chunk {} MiB",
+            total / (1 << 30),
+            start / (1 << 20),
+            chunk / (1 << 20)
+        );
+
+        // Open the overlay exactly as the agent does: backing_files=on, sparse,
+        // io_uring OFF (the path the failing VM exercises).
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&overlay)
+            .unwrap();
+        let disk = QcowDisk::new(file, false, true, true, scale_use_io_uring()).unwrap();
+
+        // 8-byte word i holds its own file offset.
+        let mk = |file_off: u64, len: usize| -> Vec<u8> {
+            let mut b = vec![0u8; len];
+            let mut o = 0usize;
+            while o < len {
+                b[o..o + 8].copy_from_slice(&(file_off + o as u64).to_le_bytes());
+                o += 8;
+            }
+            b
+        };
+
+        let mut off = start;
+        while off < start + total {
+            let buf = mk(off, chunk);
+            async_write(&disk, off, &buf);
+            off += chunk as u64;
+        }
+        {
+            let mut aio = disk.create_async_io(1).unwrap();
+            aio.fsync(Some(1)).unwrap();
+            let _ = aio.next_completed_request();
+        }
+        eprintln!("wrote {} GiB; reading back...", total / (1 << 30));
+
+        let mut off = start;
+        while off < start + total {
+            let mut aio = disk.create_async_io(1).unwrap();
+            let mut buf = vec![0xFFu8; chunk];
+            let iovec = libc::iovec {
+                iov_base: buf.as_mut_ptr().cast(),
+                iov_len: buf.len(),
+            };
+            match aio.read_vectored(off as libc::off_t, &[iovec], 1) {
+                Ok(()) => {}
+                Err(e) => panic!(
+                    "READ SUBMIT FAILED at {off} ({:.2} GiB): {e:?}",
+                    off as f64 / 1e9
+                ),
+            }
+            let (_ud, result) = aio.next_completed_request().unwrap();
+            if result < 0 {
+                panic!(
+                    "READ FAILED at {off} ({:.2} GiB): errno {} (overlay file len={})",
+                    off as f64 / 1e9,
+                    -result,
+                    std::fs::metadata(&overlay).map(|m| m.len()).unwrap_or(0)
+                );
+            }
+            assert_eq!(result as usize, chunk, "short read at {off}");
+            let expect = mk(off, chunk);
+            if buf != expect {
+                let bad = buf.iter().zip(&expect).position(|(a, b)| a != b).unwrap();
+                let badoff = off + bad as u64;
+                let aligned = (bad / 8) * 8;
+                let got = u64::from_le_bytes(buf[aligned..aligned + 8].try_into().unwrap());
+                panic!(
+                    "CORRUPTION at file offset {badoff} ({:.2} GiB): word read=0x{got:x} \
+                     expected~0x{badoff:x} (overlay file len={})",
+                    badoff as f64 / 1e9,
+                    std::fs::metadata(&overlay).map(|m| m.len()).unwrap_or(0)
+                );
+            }
+            off += chunk as u64;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("all {} GiB verified clean via QcowDisk", total / (1 << 30));
+    }
+
+    // Forces L2-table cache eviction, the path sequential I/O never exercises.
+    // The L2 cache holds only 100 tables (each covers 512 MiB), so scattering
+    // writes across the full 250 GiB overlay touches ~500 distinct L2 tables and
+    // thrashes the cache: dirty tables get evicted (write_callback writeback) and
+    // later re-read from disk. If the eviction/relocation logic mishandles an L2
+    // entry, the readback returns the wrong cluster. Writes CLUSTERS_PER_REGION
+    // clusters near the start of each STRIDE_MB region, then reads them all back.
+    //
+    //   cargo test -p block --release qcowdisk_l2_eviction_scatter -- --ignored --nocapture
+    // Env: QCOW_OVERLAY_GB(250) QCOW_BACKING_MB(256) QCOW_STRIDE_MB(512)
+    //      QCOW_CLUSTERS_PER_REGION(4)  (cluster=64 KiB)
+    #[test]
+    #[ignore]
+    fn qcowdisk_l2_eviction_scatter() {
+        use std::process::Command;
+        let envn = |k: &str, d: u64| -> u64 {
+            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        };
+        let overlay_gb = envn("QCOW_OVERLAY_GB", 250);
+        let backing_mb = envn("QCOW_BACKING_MB", 256);
+        let stride = envn("QCOW_STRIDE_MB", 512) * 1024 * 1024;
+        let clusters_per_region = envn("QCOW_CLUSTERS_PER_REGION", 4);
+        let cluster = 64 * 1024u64;
+
+        if Command::new("qemu-img").arg("--version").output().is_err() {
+            eprintln!("SKIP: qemu-img not available");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("chqd_evict_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let backing = dir.join("backing.qcow2");
+        let overlay = dir.join("overlay.qcow2");
+        let qimg = |args: &[&str]| {
+            let out = Command::new("qemu-img").args(args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "qemu-img {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        qimg(&["create", "-f", "qcow2", backing.to_str().unwrap(), &format!("{backing_mb}M")]);
+        qimg(&[
+            "create", "-f", "qcow2", "-b", backing.to_str().unwrap(), "-F", "qcow2",
+            overlay.to_str().unwrap(), &format!("{overlay_gb}G"),
+        ]);
+
+        let total = overlay_gb * (1 << 30);
+        let num_regions = total / stride;
+        eprintln!(
+            "scatter: overlay {overlay_gb} GiB, {num_regions} L2 regions (stride {} MiB), \
+             {clusters_per_region} clusters each; L2 cache=100 -> heavy eviction",
+            stride / (1 << 20)
+        );
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&overlay)
+            .unwrap();
+        let disk = QcowDisk::new(file, false, true, true, scale_use_io_uring()).unwrap();
+
+        let mk = |file_off: u64, len: usize| -> Vec<u8> {
+            let mut b = vec![0u8; len];
+            let mut o = 0usize;
+            while o < len {
+                b[o..o + 8].copy_from_slice(&(file_off + o as u64).to_le_bytes());
+                o += 8;
+            }
+            b
+        };
+
+        // Offsets we touch: clusters_per_region clusters at the start of each region.
+        let offsets = || {
+            (0..num_regions).flat_map(move |r| {
+                (0..clusters_per_region).map(move |c| r * stride + c * cluster)
+            })
+        };
+
+        let mut nw = 0u64;
+        for off in offsets() {
+            let buf = mk(off, cluster as usize);
+            async_write(&disk, off, &buf);
+            nw += 1;
+        }
+        {
+            let mut aio = disk.create_async_io(1).unwrap();
+            aio.fsync(Some(1)).unwrap();
+            let _ = aio.next_completed_request();
+        }
+        eprintln!("wrote {nw} scattered clusters; reading back...");
+
+        let mut nr = 0u64;
+        for off in offsets() {
+            let mut aio = disk.create_async_io(1).unwrap();
+            let mut buf = vec![0xFFu8; cluster as usize];
+            let iovec = libc::iovec {
+                iov_base: buf.as_mut_ptr().cast(),
+                iov_len: buf.len(),
+            };
+            aio.read_vectored(off as libc::off_t, &[iovec], 1)
+                .unwrap_or_else(|e| panic!("READ SUBMIT FAILED at {off}: {e:?}"));
+            let (_ud, result) = aio.next_completed_request().unwrap();
+            if result < 0 {
+                panic!(
+                    "READ FAILED at {off} ({:.2} GiB): errno {} (file len={})",
+                    off as f64 / 1e9,
+                    -result,
+                    std::fs::metadata(&overlay).map(|m| m.len()).unwrap_or(0)
+                );
+            }
+            let expect = mk(off, cluster as usize);
+            if buf != expect {
+                let bad = buf.iter().zip(&expect).position(|(a, b)| a != b).unwrap();
+                let aligned = (bad / 8) * 8;
+                let got = u64::from_le_bytes(buf[aligned..aligned + 8].try_into().unwrap());
+                let badoff = off + bad as u64;
+                panic!(
+                    "CORRUPTION at virtual offset {badoff} ({:.2} GiB): word read=0x{got:x} \
+                     expected~0x{badoff:x}; (read region had {got} -> region {})",
+                    badoff as f64 / 1e9,
+                    got / stride
+                );
+            }
+            nr += 1;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("all {nr} scattered clusters verified clean via QcowDisk");
+    }
+
+    // Forces repeated L2-table RELOCATION + free-list cluster reuse, the path the
+    // VM hits under sustained scattered allocation. Across PASSES passes it
+    // allocates a NEW cluster per region, visiting regions in a non-monotonic
+    // (strided-permutation) order so each region's L2 table is evicted between
+    // its allocations. Re-allocating into an evicted-then-reloaded (clean) L2
+    // table makes update_cluster_addr write the modified table to a NEW cluster
+    // and free the old one; the freed cluster is later reused for data. A bug in
+    // that relocation/free/reuse path corrupts a cluster mapping only at this
+    // scale. Then reads everything back.
+    //
+    //   cargo test -p block --release qcowdisk_alloc_churn_relocation -- --ignored --nocapture
+    // Env: QCOW_OVERLAY_GB(250) QCOW_BACKING_MB(256) QCOW_STRIDE_MB(512) QCOW_PASSES(8)
+    #[test]
+    #[ignore]
+    fn qcowdisk_alloc_churn_relocation() {
+        use std::process::Command;
+        let envn = |k: &str, d: u64| -> u64 {
+            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        };
+        let overlay_gb = envn("QCOW_OVERLAY_GB", 250);
+        let backing_mb = envn("QCOW_BACKING_MB", 256);
+        let stride = envn("QCOW_STRIDE_MB", 512) * 1024 * 1024;
+        let passes = envn("QCOW_PASSES", 8);
+        let cluster = 64 * 1024u64;
+
+        if Command::new("qemu-img").arg("--version").output().is_err() {
+            eprintln!("SKIP: qemu-img not available");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("chqd_churn_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let backing = dir.join("backing.qcow2");
+        let overlay = dir.join("overlay.qcow2");
+        let qimg = |args: &[&str]| {
+            let out = Command::new("qemu-img").args(args).output().unwrap();
+            assert!(out.status.success(), "qemu-img {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        qimg(&["create", "-f", "qcow2", backing.to_str().unwrap(), &format!("{backing_mb}M")]);
+        qimg(&[
+            "create", "-f", "qcow2", "-b", backing.to_str().unwrap(), "-F", "qcow2",
+            overlay.to_str().unwrap(), &format!("{overlay_gb}G"),
+        ]);
+
+        let total = overlay_gb * (1 << 30);
+        let num_regions = total / stride;
+        // Strided permutation of regions: step is coprime to num_regions so it
+        // visits every region exactly once per pass but in scattered order.
+        let step = 211u64.min(num_regions.saturating_sub(1)).max(1);
+        let perm = |i: u64| -> u64 { (i.wrapping_mul(step) + 1) % num_regions };
+        eprintln!(
+            "churn: overlay {overlay_gb} GiB, {num_regions} regions, {passes} passes, \
+             non-monotonic step={step}; L2 cache=100 -> evict+relocate"
+        );
+
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(&overlay).unwrap();
+        let disk = QcowDisk::new(file, false, true, true, scale_use_io_uring()).unwrap();
+
+        let mk = |file_off: u64, len: usize| -> Vec<u8> {
+            let mut b = vec![0u8; len];
+            let mut o = 0usize;
+            while o < len {
+                b[o..o + 8].copy_from_slice(&(file_off + o as u64).to_le_bytes());
+                o += 8;
+            }
+            b
+        };
+
+        let mut nw = 0u64;
+        for pass in 0..passes {
+            for i in 0..num_regions {
+                let region = perm(i);
+                let off = region * stride + pass * cluster; // a fresh cluster each pass
+                let buf = mk(off, cluster as usize);
+                async_write(&disk, off, &buf);
+                nw += 1;
+            }
+            // flush between passes so eviction/relocation writeback is committed
+            let mut aio = disk.create_async_io(1).unwrap();
+            aio.fsync(Some(1)).unwrap();
+            let _ = aio.next_completed_request();
+        }
+        eprintln!("wrote {nw} clusters across {passes} passes; reading back...");
+
+        let mut nr = 0u64;
+        for pass in 0..passes {
+            for region in 0..num_regions {
+                let off = region * stride + pass * cluster;
+                let mut aio = disk.create_async_io(1).unwrap();
+                let mut buf = vec![0xFFu8; cluster as usize];
+                let iovec = libc::iovec {
+                    iov_base: buf.as_mut_ptr().cast(),
+                    iov_len: buf.len(),
+                };
+                aio.read_vectored(off as libc::off_t, &[iovec], 1)
+                    .unwrap_or_else(|e| panic!("READ SUBMIT FAILED at {off}: {e:?}"));
+                let (_ud, result) = aio.next_completed_request().unwrap();
+                if result < 0 {
+                    panic!("READ FAILED at {off} ({:.2} GiB): errno {}", off as f64 / 1e9, -result);
+                }
+                let expect = mk(off, cluster as usize);
+                if buf != expect {
+                    let bad = buf.iter().zip(&expect).position(|(a, b)| a != b).unwrap();
+                    let aligned = (bad / 8) * 8;
+                    let got = u64::from_le_bytes(buf[aligned..aligned + 8].try_into().unwrap());
+                    let badoff = off + bad as u64;
+                    panic!(
+                        "CORRUPTION at virtual offset {badoff} ({:.2} GiB, pass {pass} region {region}): \
+                         word read=0x{got:x} expected~0x{badoff:x}; read data belongs to offset {got} \
+                         (region {}, pass {})",
+                        badoff as f64 / 1e9,
+                        got / stride,
+                        (got % stride) / cluster
+                    );
+                }
+                nr += 1;
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("all {nr} clusters verified clean via QcowDisk after {passes}-pass churn");
+    }
+
+    // Concurrent allocation + discard churn across THREADS sharing one QcowDisk
+    // (the real multi-queue model: metadata is Arc<RwLock>, data fd cloned per
+    // worker). Each thread owns a disjoint set of regions so the final state is
+    // deterministic and verifiable. Threads concurrently allocate new clusters,
+    // and discard (punch_hole) earlier ones, freeing clusters that OTHER threads'
+    // allocations then pop off the free list. A race between an L2-clear/refcount
+    // -free and a concurrent realloc/relocation corrupts a mapping or points it
+    // past EOF -- exactly the live symptom. Main thread verifies every address.
+    //
+    //   cargo test -p block --release qcowdisk_concurrent_churn_discard -- --ignored --nocapture
+    // Env: QCOW_OVERLAY_GB(250) QCOW_BACKING_MB(256) QCOW_STRIDE_MB(512)
+    //      QCOW_PASSES(6) QCOW_THREADS(8)
+    #[test]
+    #[ignore]
+    fn qcowdisk_concurrent_churn_discard() {
+        use std::collections::HashSet;
+        use std::process::Command;
+        use std::sync::Arc;
+        let envn = |k: &str, d: u64| -> u64 {
+            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        };
+        let overlay_gb = envn("QCOW_OVERLAY_GB", 250);
+        let backing_mb = envn("QCOW_BACKING_MB", 256);
+        let stride = envn("QCOW_STRIDE_MB", 512) * 1024 * 1024;
+        let passes = envn("QCOW_PASSES", 6);
+        let nthreads = envn("QCOW_THREADS", 8);
+        let cluster = 64 * 1024u64;
+
+        if Command::new("qemu-img").arg("--version").output().is_err() {
+            eprintln!("SKIP: qemu-img not available");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("chqd_cc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let backing = dir.join("backing.qcow2");
+        let overlay = dir.join("overlay.qcow2");
+        let qimg = |args: &[&str]| {
+            let out = Command::new("qemu-img").args(args).output().unwrap();
+            assert!(out.status.success(), "qemu-img {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        qimg(&["create", "-f", "qcow2", backing.to_str().unwrap(), &format!("{backing_mb}M")]);
+        qimg(&[
+            "create", "-f", "qcow2", "-b", backing.to_str().unwrap(), "-F", "qcow2",
+            overlay.to_str().unwrap(), &format!("{overlay_gb}G"),
+        ]);
+
+        let total = overlay_gb * (1 << 30);
+        let num_regions = total / stride;
+        eprintln!(
+            "concurrent: overlay {overlay_gb} GiB, {num_regions} regions, {nthreads} threads, \
+             {passes} passes, alloc+discard churn on shared QcowDisk"
+        );
+
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(&overlay).unwrap();
+        let disk = Arc::new(QcowDisk::new(file, false, true, true, scale_use_io_uring()).unwrap());
+
+        let mk = |file_off: u64, len: usize| -> Vec<u8> {
+            let mut b = vec![0u8; len];
+            let mut o = 0usize;
+            while o < len {
+                b[o..o + 8].copy_from_slice(&(file_off + o as u64).to_le_bytes());
+                o += 8;
+            }
+            b
+        };
+
+        // Each thread handles regions where region % nthreads == t. For pass p it
+        // writes off = region*stride + p*cluster, and discards pass (p-1)'s cluster
+        // for half its regions. Returns the set of discarded offsets.
+        let threads: Vec<_> = (0..nthreads)
+            .map(|t| {
+                let disk = Arc::clone(&disk);
+                thread::spawn(move || -> HashSet<u64> {
+                    let mut discarded = HashSet::new();
+                    for p in 0..passes {
+                        let mut region = t;
+                        while region < num_regions {
+                            let off = region * stride + p * cluster;
+                            let buf = mk(off, cluster as usize);
+                            async_write(&disk, off, &buf);
+
+                            // discard previous pass's cluster for half the regions
+                            if p > 0 && region % 2 == 0 {
+                                let doff = region * stride + (p - 1) * cluster;
+                                let mut aio = disk.create_async_io(1).unwrap();
+                                aio.punch_hole(doff, cluster, 7).unwrap();
+                                let _ = aio.next_completed_request();
+                                discarded.insert(doff);
+                            }
+                            region += nthreads;
+                        }
+                    }
+                    discarded
+                })
+            })
+            .collect();
+
+        let mut discarded: HashSet<u64> = HashSet::new();
+        for th in threads {
+            discarded.extend(th.join().unwrap());
+        }
+        {
+            let mut aio = disk.create_async_io(1).unwrap();
+            aio.fsync(Some(1)).unwrap();
+            let _ = aio.next_completed_request();
+        }
+        eprintln!(
+            "concurrent churn done ({} discarded); reading back all {} cells...",
+            discarded.len(),
+            num_regions * passes
+        );
+
+        let mut checked = 0u64;
+        for region in 0..num_regions {
+            for p in 0..passes {
+                let off = region * stride + p * cluster;
+                let mut aio = disk.create_async_io(1).unwrap();
+                let mut buf = vec![0xFFu8; cluster as usize];
+                let iovec = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
+                aio.read_vectored(off as libc::off_t, &[iovec], 1)
+                    .unwrap_or_else(|e| panic!("READ SUBMIT FAILED at {off}: {e:?}"));
+                let (_ud, result) = aio.next_completed_request().unwrap();
+                if result < 0 {
+                    panic!("READ FAILED at {off} ({:.2} GiB): errno {}", off as f64 / 1e9, -result);
+                }
+                if discarded.contains(&off) {
+                    if !buf.iter().all(|&b| b == 0) {
+                        let nz = buf.iter().position(|&b| b != 0).unwrap();
+                        let a = (nz / 8) * 8;
+                        let got = u64::from_le_bytes(buf[a..a + 8].try_into().unwrap());
+                        panic!(
+                            "DISCARDED cell at {off} ({:.2} GiB) not zero: word=0x{got:x} \
+                             (data belongs to offset {got})",
+                            off as f64 / 1e9
+                        );
+                    }
+                } else {
+                    let expect = mk(off, cluster as usize);
+                    if buf != expect {
+                        let bad = buf.iter().zip(&expect).position(|(a, b)| a != b).unwrap();
+                        let a = (bad / 8) * 8;
+                        let got = u64::from_le_bytes(buf[a..a + 8].try_into().unwrap());
+                        let badoff = off + bad as u64;
+                        panic!(
+                            "CORRUPTION at {badoff} ({:.2} GiB, region {region} pass {p}): \
+                             word read=0x{got:x} expected~0x{badoff:x}; data belongs to offset {got} \
+                             (region {} pass {})",
+                            badoff as f64 / 1e9,
+                            got / stride,
+                            (got % stride) / cluster
+                        );
+                    }
+                }
+                checked += 1;
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("all {checked} cells verified (incl. {} discards) after concurrent churn", discarded.len());
+    }
+
+    // The one qcow2 path the other repros never touch: reading + COW from a
+    // POPULATED multi-level backing chain at high offsets. The real Windows chain
+    // is golden <- patched <- overlay where golden/patched hold GBs of actual NTFS
+    // data; every prior test used an empty (zero-fill) backing. This builds a
+    // 3-level chain, scatters offset-encoded data into the BASE at high offsets,
+    // then through the overlay: (1) reads unallocated clusters (chain traversal to
+    // base), (2) reads beyond the base's virtual size (zero), and (3) does
+    // partial-cluster writes over populated clusters (COW merge from base) and
+    // verifies the merged result. A bug in Qcow2Backing::read_at / cow_write_sync
+    // at scale corrupts here.
+    //
+    //   cargo test -p block --release [--features io_uring] qcowdisk_populated_backing_chain -- --ignored --nocapture
+    // Env: QCOW_BASE_GB(130) QCOW_OVERLAY_GB(250) QCOW_STRIDE_MB(512)
+    //      QCOW_POP_START_GB(96) QCOW_IO_URING(0|1)
+    #[test]
+    #[ignore]
+    fn qcowdisk_populated_backing_chain() {
+        use std::process::Command;
+        let envn = |k: &str, d: u64| -> u64 {
+            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        };
+        let base_gb = envn("QCOW_BASE_GB", 130);
+        let overlay_gb = envn("QCOW_OVERLAY_GB", 250);
+        let stride = envn("QCOW_STRIDE_MB", 512) * 1024 * 1024;
+        let pop_start = envn("QCOW_POP_START_GB", 96) * (1 << 30);
+        let cluster = 64 * 1024u64;
+
+        if Command::new("qemu-img").arg("--version").output().is_err() {
+            eprintln!("SKIP: qemu-img not available");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("chqd_pop_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let golden = dir.join("golden.qcow2");
+        let patched = dir.join("patched.qcow2");
+        let overlay = dir.join("overlay.qcow2");
+        let qimg = |args: &[&str]| {
+            let out = Command::new("qemu-img").args(args).output().unwrap();
+            assert!(out.status.success(), "qemu-img {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+
+        let mk = |file_off: u64, len: usize| -> Vec<u8> {
+            let mut b = vec![0u8; len];
+            let mut o = 0usize;
+            while o < len {
+                // tag base bytes distinctly (high bit) so we can tell base vs overlay
+                b[o..o + 8].copy_from_slice(&((file_off + o as u64) | (1u64 << 63)).to_le_bytes());
+                o += 8;
+            }
+            b
+        };
+
+        // Populated cluster offsets: one per stride from pop_start up to base end.
+        let base_end = base_gb * (1 << 30);
+        let pop_offsets: Vec<u64> = (pop_start..base_end).step_by(stride as usize).collect();
+
+        // 1) Create + populate golden (no backing) at high offsets.
+        qimg(&["create", "-f", "qcow2", golden.to_str().unwrap(), &format!("{base_gb}G")]);
+        {
+            let f = std::fs::OpenOptions::new().read(true).write(true).open(&golden).unwrap();
+            let gdisk = QcowDisk::new(f, false, false, true, scale_use_io_uring()).unwrap();
+            for &off in &pop_offsets {
+                let buf = mk(off, cluster as usize);
+                async_write(&gdisk, off, &buf);
+            }
+            let mut aio = gdisk.create_async_io(1).unwrap();
+            aio.fsync(Some(1)).unwrap();
+            let _ = aio.next_completed_request();
+        }
+        // 2) patched <- golden (inherits base size), overlay <- patched (larger).
+        qimg(&["create", "-f", "qcow2", "-b", golden.to_str().unwrap(), "-F", "qcow2", patched.to_str().unwrap()]);
+        // Mirror the agent's host-local workaround: grow the patched backing's
+        // virtual size (metadata-only) so the overlay stays <= its backing.
+        let patched_resize_gb = envn("QCOW_PATCHED_RESIZE_GB", 0);
+        if patched_resize_gb > 0 {
+            qimg(&["resize", patched.to_str().unwrap(), &format!("{patched_resize_gb}G")]);
+        }
+        qimg(&[
+            "create", "-f", "qcow2", "-b", patched.to_str().unwrap(), "-F", "qcow2",
+            overlay.to_str().unwrap(), &format!("{overlay_gb}G"),
+        ]);
+        eprintln!(
+            "chain: golden {base_gb}G (populated {} clusters from {} GiB) <- patched <- overlay {overlay_gb}G; io_uring={}",
+            pop_offsets.len(), pop_start / (1 << 30), scale_use_io_uring()
+        );
+
+        let f = std::fs::OpenOptions::new().read(true).write(true).open(&overlay).unwrap();
+        let disk = QcowDisk::new(f, false, true, true, scale_use_io_uring()).unwrap();
+
+        let read_cluster = |off: u64| -> Vec<u8> {
+            let mut aio = disk.create_async_io(1).unwrap();
+            let mut buf = vec![0xABu8; cluster as usize];
+            let iovec = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
+            aio.read_vectored(off as libc::off_t, &[iovec], 1)
+                .unwrap_or_else(|e| panic!("READ SUBMIT FAILED at {off}: {e:?}"));
+            let (_ud, result) = aio.next_completed_request().unwrap();
+            if result < 0 {
+                panic!("READ FAILED at {off} ({:.2} GiB): errno {}", off as f64 / 1e9, -result);
+            }
+            buf
+        };
+
+        // (1) Read populated clusters THROUGH the overlay -> chain traversal to base.
+        for &off in &pop_offsets {
+            let buf = read_cluster(off);
+            let expect = mk(off, cluster as usize);
+            if buf != expect {
+                let bad = buf.iter().zip(&expect).position(|(a, b)| a != b).unwrap();
+                let a = (bad / 8) * 8;
+                let got = u64::from_le_bytes(buf[a..a + 8].try_into().unwrap());
+                panic!(
+                    "BACKING-READ CORRUPTION at {} ({:.2} GiB): word=0x{got:x} expected=0x{:x}",
+                    off + bad as u64, (off + bad as u64) as f64 / 1e9,
+                    (off | (1u64 << 63)) + (a as u64)
+                );
+            }
+        }
+        eprintln!("verified {} populated backing clusters read through overlay", pop_offsets.len());
+
+        // (2) Read beyond the base virtual size -> must be zero (overlay unallocated,
+        // beyond backing).
+        let beyond = base_end + 10 * (1 << 30); // 10 GiB past base, within overlay
+        let buf = read_cluster(beyond);
+        assert!(buf.iter().all(|&b| b == 0), "beyond-base read should be zeros at {beyond}");
+
+        // (3) Partial-cluster write over a populated cluster -> COW merge from base.
+        let target = pop_offsets[pop_offsets.len() / 2];
+        let half = (cluster / 2) as usize;
+        let newdata = vec![0x5Au8; half]; // overwrite first half only
+        async_write(&disk, target, &newdata);
+        {
+            let mut aio = disk.create_async_io(1).unwrap();
+            aio.fsync(Some(1)).unwrap();
+            let _ = aio.next_completed_request();
+        }
+        let buf = read_cluster(target);
+        assert!(buf[..half].iter().all(|&b| b == 0x5A), "COW: written half wrong");
+        let base = mk(target, cluster as usize);
+        assert_eq!(&buf[half..], &base[half..], "COW: unwritten half must be merged from base");
+        eprintln!("verified partial-cluster COW merge from populated base at {target}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("populated backing chain verified clean via QcowDisk");
     }
 }
