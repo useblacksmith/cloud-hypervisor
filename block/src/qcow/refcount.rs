@@ -82,10 +82,20 @@ impl RefCount {
         } else {
             (1u64 << refcount_bits) - 1
         };
+        // Size the refcount-block cache to hold every refcount block the image
+        // can have, so it never evicts. The eviction path (writing a dirty block
+        // back and reloading it later) has a latent corruption bug that loses
+        // cluster accounting once an image's physical size exceeds the cache's
+        // coverage (default 50 blocks => 100 GiB at 16-bit/64 KiB), surfacing as
+        // clusters that read back as zeros or map past EOF. Blocks are allocated
+        // lazily (~64 KiB each, only when touched), so this only bounds the
+        // HashMap; the floor keeps small images cheap and the cap bounds memory
+        // for pathologically large images (4096 blocks => 8 TiB coverage).
+        let refblock_cache_cap = (refcount_table_entries as usize).clamp(50, 4096);
         Ok(RefCount {
             ref_table,
             refcount_table_offset,
-            refblock_cache: CacheMap::new(50),
+            refblock_cache: CacheMap::new(refblock_cache_cap),
             refcount_block_entries,
             cluster_size,
             max_valid_cluster_offset,
