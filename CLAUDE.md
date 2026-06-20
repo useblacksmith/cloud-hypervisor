@@ -106,9 +106,11 @@ Rules to keep regressions bisectable:
 3. **Control bases:** `patchset-v<base>` branches are our patches cherry-picked onto a specific
    upstream tag, released as `patchset-v<base>.0-<ts>`. They give a clean 2x2 — stock-vOLD /
    vOLD+patches / stock-vNEW / vNEW+patches. `patchset-v49` exists for exactly this (the
-   pre-#4130 base). **Caveat:** a v49 binary reports `v49.0`, so the agent version-gating won't
-   add `image_type=qcow2,backing_files=on` (needs v51+) — v49+patches **cannot boot the Windows
-   CoW overlay**; it isolates patch-vs-base for **Linux**/general boot+serial paths only.
+   pre-#4130 base). **Verified (devbox, 2026-06-20): v49+patches boots a Windows CoW VM fine**
+   (guest reached `start_runner`). The agent gates `image_type=qcow2,backing_files=on` *off* for
+   v49 (it's a v51+ option), but v49 traverses the qcow2 backing chain **by default**, so the
+   Windows boot disk still opens — so this is a valid control for **both Windows and Linux**
+   A/Bs. (It also won't add `nested=on`, gated ≥v50, so it's not for nested-virt testing.)
 
 > Remote-naming footgun: in a local clone the **fork** remote may be `blacksmith`, not `origin`
 > (`origin` can point at upstream `cloud-hypervisor/cloud-hypervisor`). **Run `git remote -v`
